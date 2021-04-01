@@ -1,0 +1,4 @@
+*.pt 
+*.png 
+__pycache__
+*.txt

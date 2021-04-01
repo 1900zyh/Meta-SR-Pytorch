@@ -11,15 +11,17 @@ parser.add_argument('--template', default='.',
 # Hardware specifications
 parser.add_argument('--n_threads', type=int, default=6,
                     help='number of threads for data loading')
+parser.add_argument('--block_size', type=int, default=128,
+                    help='block size used in forward_fold ')
 parser.add_argument('--cpu', action='store_true',
                     help='use cpu only')
-parser.add_argument('--n_GPUs', type=int, default=3,
+parser.add_argument('--n_GPUs', type=int, default=4,
                     help='number of GPUs')
 parser.add_argument('--seed', type=int, default=1,
                     help='random seed')
 
 # Data specifications
-parser.add_argument('--dir_data', type=str, default='./',
+parser.add_argument('--dir_data', type=str, default='../dataset',
                     help='dataset directory')
 parser.add_argument('--dir_demo', type=str, default='../test',
                     help='demo image directory')
@@ -144,6 +146,8 @@ parser.add_argument('--print_every', type=int, default=100,
                     help='how many batches to wait before logging training status')
 parser.add_argument('--save_results', action='store_true',
                     help='save output results')
+parser.add_argument('--fold', action='store_true',
+                    help='enable memory-efficient inference')
 
 args = parser.parse_args()
 template.set_template(args)
@@ -157,7 +161,8 @@ if args.scale=='':
     args.scale = [1.1,1.2,1.3,1.4,1.5,1.6,1.7,1.8,1.9,2.0,2.1,2.2,2.3,2.4,2.5,2.6,2.7,2.8,2.9,3.0,3.1,3.2,3.3,3.4,3.5,3.6,3.7,3.8,3.9,4.0]
     #print(args.scale)
 else:
-    args.scale = list(map(lambda x: float(x), args.scale.split('+')))
+    args.scale = list(map(lambda x: int(x), args.scale.split('+')))
+
 print(args.scale)
 if args.epochs == 0:
     args.epochs = 1e8

@@ -7,6 +7,7 @@ import time
 import torch
 import torch.nn as nn
 import math
+from model.common import input_matrix_wpn
 
 def make_model(args, parent=False):
     return MetaRDN(args)
@@ -109,7 +110,14 @@ class MetaRDN(nn.Module):
 
         return x.contiguous().view(-1, C, H, W)
 
-    def forward(self, x, pos_mat):
+    def forward(self, x):
+        scale = self.scale 
+        n, xc, xh, xw = x.size()
+    
+        pos_mat, mask = input_matrix_wpn(xh, xw, scale)  ###  get the position matrix, mask
+        pos_mat = pos_mat.to(x.device)
+        mask = mask.to(x.device)
+
         #d1 =time.time()
         x = self.sub_mean(x)
         f__1 = self.SFENet1(x)
@@ -138,7 +146,9 @@ class MetaRDN(nn.Module):
         out = out.contiguous().view(x.size(0),scale_int,scale_int,3,x.size(2),x.size(3)).permute(0,3,4,1,5,2)
         out = out.contiguous().view(x.size(0),3, scale_int*x.size(2),scale_int*x.size(3))
         out = self.add_mean(out)
-
+        
+        out = torch.masked_select(out, mask)
+        out = out.contiguous().view(n, xc, xh*scale, xw*scale)
         return out
 
     def set_scale(self, scale_idx):

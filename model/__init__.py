@@ -1,19 +1,25 @@
 import os
+import math 
 from importlib import import_module
 
 import torch
 import torch.nn as nn
 from torch.autograd import Variable
+import torch.nn.parallel as P
+import torch.nn.functional as F
+from model.common import input_matrix_wpn
 
 class Model(nn.Module):
     def __init__(self, args, ckp):
         super(Model, self).__init__()
         print('Making model...')
 
+        self.args = args
         self.scale = args.scale
         self.idx_scale = 0
         self.self_ensemble = args.self_ensemble
         self.chop = args.chop
+        self.fold = args.fold
         self.precision = args.precision
         self.cpu = args.cpu
         self.device = torch.device('cpu' if args.cpu else 'cuda')
@@ -24,9 +30,6 @@ class Model(nn.Module):
         self.model = module.make_model(args).to(self.device)
         if args.precision == 'half': self.model.half()
 
-        if not args.cpu and args.n_GPUs > 1:
-            self.model = nn.DataParallel(self.model, range(args.n_GPUs))
-
         self.load(
             ckp.dir,
             pre_train=args.pre_train,
@@ -35,49 +38,49 @@ class Model(nn.Module):
         )
         print(self.model, file=ckp.log_file)
 
-    def forward(self, x, idx_scale, pos_mat):
+    def forward(self, x, idx_scale):
         self.idx_scale = idx_scale
-        target = self.get_model()
-        if hasattr(target, 'set_scale'):
-            target.set_scale(idx_scale)
+        if hasattr(self, 'set_scale'):
+            self.set_scale(idx_scale)
+        
+        if self.training: 
+            if self.n_GPUs > 1:
+                return P.data_parallel(self.model, x, range(self.n_GPUs))
+            else:
+                return self.model(x)
 
         if self.self_ensemble and not self.training:
             if self.chop:
                 forward_function = self.forward_chop
+            elif self.fold: 
+                forward_function = self.forward_fold
             else:
                 forward_function = self.model.forward
 
             return self.forward_x8(x, forward_function)
         elif self.chop and not self.training:
             return self.forward_chop(x)
+        elif self.fold and not self.training: 
+            return self.forward_fold(x, block_size=self.args.block_size)
         else:
-            return self.model(x,pos_mat)
+            self.model.set_scale(idx_scale)
+            return self.model(x)
 
-    def get_model(self):
-        if self.n_GPUs <= 1 or self.cpu:
-            return self.model
-        else:
-            return self.model.module
-
-    def state_dict(self, **kwargs):
-        target = self.get_model()
-        return target.state_dict(**kwargs)
 
     def save(self, apath, epoch, is_best=False):
-        target = self.get_model()
         torch.save(
-            target.state_dict(),
+            self.state_dict(),
             os.path.join(apath, 'model', 'model_latest.pt')
         )
         if is_best:
             torch.save(
-                target.state_dict(),
+                self.state_dict(),
                 os.path.join(apath, 'model', 'model_best.pt')
             )
 
         if self.save_models:
             torch.save(
-                target.state_dict(),
+                self.state_dict(),
                 os.path.join(apath, 'model', 'model_{}.pt'.format(epoch))
             )
 
@@ -88,7 +91,7 @@ class Model(nn.Module):
             kwargs = {}
 
         if resume == -1:
-            self.get_model().load_state_dict(
+            self.model.load_state_dict(
                 torch.load(
                     os.path.join(apath, 'model', 'model_latest.pt'),
                     **kwargs
@@ -98,13 +101,13 @@ class Model(nn.Module):
         elif resume == 0:
             if pre_train != '.':
                 print('Loading model from {}'.format(pre_train))
-                self.get_model().load_state_dict(
+                self.model.load_state_dict(
                     torch.load(pre_train, **kwargs),
-                    strict=False
+                    strict=True
                 )
                 print('load_model_mode=1')
         else:
-            self.get_model().load_state_dict(
+            self.model.load_state_dict(
                 torch.load(
                     os.path.join(apath, 'model', 'model_{}.pt'.format(resume)),
                     **kwargs
@@ -189,3 +192,44 @@ class Model(nn.Module):
 
         return output
 
+
+    def forward_fold(self, x, shave=10, block_size=128): 
+        scale = self.scale[self.idx_scale]
+        self.model.set_scale(self.idx_scale)
+        n_GPUs = self.n_GPUs
+        bs = self.args.batch_size
+        # height, width
+        b, c, h, w = x.size()
+        
+        # image to tokens 
+        stride = block_size - shave
+        ph = math.ceil((h-block_size)/stride) * stride - (h-block_size)
+        pw = math.ceil((w-block_size)/stride) * stride - (w-block_size)
+        th = (h + ph - block_size) // stride + 1
+        tw = (w + pw - block_size) // stride + 1 
+        x2 = F.pad(x, pad=(0, pw, 0, ph), mode='replicate')
+        inputs = F.unfold(x2, kernel_size=block_size, stride=stride, padding=0, dilation=1)
+        
+        inputs = inputs.permute(0, 2, 1).contiguous()
+        inputs = inputs.view(b*th*tw, 3, block_size, block_size)
+
+        
+        # inference 
+        y_chops = []
+        for i in range(0, inputs.size(0), bs):
+            y = inputs[i:(i + bs), ...]
+            y = P.data_parallel(self.model, y, range(n_GPUs))
+            y_chops.append(y)
+        y = torch.cat(y_chops, dim=0)
+
+        # tokens to image 
+        y = y.view(b, th*tw, 3*(block_size*scale)**2).permute(0, 2, 1).contiguous()
+        h1, w1 = (th-1)*stride*scale+block_size*scale, (tw-1)*stride*scale+block_size*scale
+        y = F.fold(y, output_size=(h1, w1),  kernel_size=block_size*scale, stride=stride*scale)
+        norm_map = F.fold(
+            F.unfold(torch.ones(1, 1, h1, w1).type(torch.FloatTensor), kernel_size=block_size*scale, stride=stride*scale), 
+            output_size=(h1, w1),  kernel_size=block_size*scale, stride=stride*scale) + 1e-12 
+        y /= norm_map.to(y.device)
+        y = y[:, :, :h*scale, :w*scale]
+
+        return y 
